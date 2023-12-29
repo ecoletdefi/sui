@@ -8,14 +8,15 @@ use async_graphql::{
     *,
 };
 use diesel::{
-    query_builder::QueryFragment, query_dsl::LoadQuery, QueryDsl, QueryResult, QuerySource,
+    deserialize::FromSqlRow, query_builder::QueryFragment, query_dsl::LoadQuery,
+    sql_types::Untyped, QueryDsl, QueryResult, QuerySource,
 };
 use fastcrypto::encoding::{Base64, Encoding};
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     config::ServiceConfig,
-    data::{Conn, DbConnection, DieselBackend, DieselConn, Query},
+    data::{Conn, DbConnection, DieselBackend, DieselConn, Query, RawSqlQuery},
     error::Error,
 };
 
@@ -74,7 +75,18 @@ pub(crate) trait Target<C: CursorType> {
     /// (returning the new query). The `asc` parameter controls whether the ordering is ASCending
     /// (`true`) or descending (`false`).
     fn order<ST, GB>(asc: bool, query: Query<ST, Self::Source, GB>) -> Query<ST, Self::Source, GB>;
+}
 
+/// Equivalent to Target<C>, for raw sql queries.
+pub(crate) trait RawTarget<C: CursorType> {
+    fn filter_ge(cursor: &C, query: &mut RawSqlQuery);
+
+    fn filter_le(cursor: &C, query: &mut RawSqlQuery);
+
+    fn order(asc: bool, query: &mut RawSqlQuery);
+}
+
+pub(crate) trait CreateCursor<C: CursorType> {
     /// The cursor pointing at this target value.
     fn cursor(&self) -> C;
 }
@@ -197,7 +209,7 @@ impl<C: CursorType + Eq + Clone + Send + Sync + 'static> Page<C> {
         <T as Target<C>>::Source: Send + 'static,
         <<T as Target<C>>::Source as QuerySource>::FromClause: Send + 'static,
         Q: Send + 'static,
-        T: Send + Target<C> + 'static,
+        T: Send + Target<C> + CreateCursor<C> + 'static,
         ST: Send + 'static,
         GB: Send + 'static,
     {
@@ -228,6 +240,56 @@ impl<C: CursorType + Eq + Clone + Send + Sync + 'static> Page<C> {
             results
         };
 
+        // The remaining bit can be split out
+        Ok(self.paginate_results(results))
+    }
+
+    pub(crate) fn paginate_raw_query<T, Q>(
+        &self,
+        conn: &mut Conn<'_>,
+        query: Q,
+    ) -> QueryResult<(bool, bool, impl Iterator<Item = T>)>
+    where
+        Q: Fn() -> RawSqlQuery,
+        T: Send + RawTarget<C> + CreateCursor<C> + FromSqlRow<Untyped, DieselBackend> + 'static,
+    {
+        let mut query = query();
+
+        if let Some(after) = self.after() {
+            T::filter_ge(after, &mut query);
+        }
+
+        if let Some(before) = self.before() {
+            T::filter_le(before, &mut query);
+        }
+
+        T::order(self.is_from_front(), &mut query);
+        query.limit(self.limit() as i64 + 2);
+
+        println!("query: {}", query.sql);
+
+        let results: Vec<T> = if self.limit() == 0 {
+            // Avoid the database roundtrip in the degenerate case.
+            vec![]
+        } else {
+            let mut results: Vec<T> = conn.raw_results(query.sql)?;
+            if !self.is_from_front() {
+                results.reverse();
+            }
+            results
+        };
+
+        // The remaining bit can be split out
+        Ok(self.paginate_results(results))
+    }
+
+    pub(crate) fn paginate_results<T>(
+        &self,
+        results: Vec<T>,
+    ) -> (bool, bool, impl Iterator<Item = T>)
+    where
+        T: Send + CreateCursor<C> + 'static,
+    {
         // Detect whether the results imply the existence of a previous or next page.
         let (prev, next, prefix, suffix) = match (
             self.after(),
@@ -240,18 +302,18 @@ impl<C: CursorType + Eq + Clone + Send + Sync + 'static> Page<C> {
             // cursors, so the bounds must have been invalid, no matter which end the page was
             // drawn from.
             (_, None, _, _, _) | (_, _, None, _, _) => {
-                return Ok((false, false, vec![].into_iter()));
+                return (false, false, vec![].into_iter());
             }
 
             // Page drawn from the front, and the cursor for the first element does not match
             // `after`. This implies the bound was invalid, so we return an empty result.
             (Some(a), Some(f), _, _, End::Front) if f.cursor() != *a => {
-                return Ok((false, false, vec![].into_iter()));
+                return (false, false, vec![].into_iter());
             }
 
             // Similar to above case, but for back of results.
             (_, _, Some(l), Some(b), End::Back) if l.cursor() != *b => {
-                return Ok((false, false, vec![].into_iter()));
+                return (false, false, vec![].into_iter());
             }
 
             // From here onwards, we know that the results are non-empty and if a cursor was
@@ -290,7 +352,7 @@ impl<C: CursorType + Eq + Clone + Send + Sync + 'static> Page<C> {
         // previous or next page, because there will be no start or end cursor for this page to
         // anchor on.
         if results.len() == prefix + suffix {
-            return Ok((false, false, vec![].into_iter()));
+            return (false, false, vec![].into_iter());
         }
 
         // We finally made it -- trim the prefix and suffix rows from the result and send it!
@@ -302,7 +364,7 @@ impl<C: CursorType + Eq + Clone + Send + Sync + 'static> Page<C> {
             results.nth_back(suffix - 1);
         }
 
-        Ok((prev, next, results))
+        (prev, next, results)
     }
 }
 

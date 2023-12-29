@@ -4,6 +4,9 @@
 use super::QueryExecutor;
 use crate::{config::Limits, error::Error};
 use async_trait::async_trait;
+use diesel::deserialize::FromSqlRow;
+use diesel::sql_function;
+use diesel::sql_types::{Int8, Nullable, Untyped};
 use diesel::{
     pg::Pg,
     query_builder::{Query, QueryFragment, QueryId},
@@ -88,6 +91,14 @@ impl<'c> super::DbConnection for PgConnection<'c> {
         query_cost::log(self.conn, self.max_cost, query());
         query().get_results(self.conn)
     }
+
+    fn raw_results<U>(&mut self, query: String) -> QueryResult<Vec<U>>
+    where
+        U: FromSqlRow<Untyped, Self::Backend> + 'static,
+    {
+        query_cost::log(self.conn, self.max_cost, diesel::sql_query(query.clone()));
+        diesel::sql_query(query).load::<U>(self.conn)
+    }
 }
 
 /// Support for calculating estimated query cost using EXPLAIN and then logging it.
@@ -155,6 +166,8 @@ mod query_cost {
         parsed.get(0)?.get("Plan")?.get("Total Cost")?.as_f64()
     }
 }
+
+sql_function! { fn coalesce(x: Nullable<Int8>, y: Int8) -> Int8; }
 
 #[cfg(all(test, feature = "pg_integration"))]
 mod tests {

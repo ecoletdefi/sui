@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::cursor::{self, Page, Target};
+use super::cursor::{self, CreateCursor, Page, Target};
 use super::{big_int::BigInt, move_type::MoveType, sui_address::SuiAddress};
 use crate::data::{self, Db, DbConnection, QueryExecutor};
 use crate::error::Error;
@@ -131,7 +131,9 @@ impl Target<Cursor> for StoredBalance {
             query.order_by(dsl::coin_type.desc())
         }
     }
+}
 
+impl CreateCursor<Cursor> for StoredBalance {
     fn cursor(&self) -> Cursor {
         Cursor::new(self.2.clone())
     }

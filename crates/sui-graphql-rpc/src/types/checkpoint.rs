@@ -3,7 +3,7 @@
 
 use super::{
     base64::Base64,
-    cursor::{self, Page, Target},
+    cursor::{self, CreateCursor, Page, Target},
     date_time::DateTime,
     digest::Digest,
     epoch::Epoch,
@@ -250,7 +250,9 @@ impl Target<Cursor> for StoredCheckpoint {
             query.order(dsl::sequence_number.desc())
         }
     }
+}
 
+impl CreateCursor<Cursor> for StoredCheckpoint {
     fn cursor(&self) -> Cursor {
         Cursor::new(self.sequence_number as u64)
     }

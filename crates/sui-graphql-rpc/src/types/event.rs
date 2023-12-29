@@ -3,7 +3,7 @@
 
 use std::str::FromStr;
 
-use super::cursor::{self, Page, Target};
+use super::cursor::{self, CreateCursor, Page, Target};
 use super::digest::Digest;
 use super::type_filter::{ModuleFilter, TypeFilter};
 use super::{
@@ -291,7 +291,9 @@ impl Target<Cursor> for StoredEvent {
                 .then_order_by(dsl::event_sequence_number.desc())
         }
     }
+}
 
+impl CreateCursor<Cursor> for StoredEvent {
     fn cursor(&self) -> Cursor {
         Cursor::new(EventKey {
             tx: self.tx_sequence_number as u64,

@@ -26,7 +26,7 @@ use sui_types::TypeTag;
 
 use super::balance;
 use super::big_int::BigInt;
-use super::cursor::{self, Page, Target};
+use super::cursor::{self, CreateCursor, Page, RawTarget, Target};
 use super::display::{get_rendered_fields, DisplayEntry};
 use super::dynamic_field::{DynamicField, DynamicFieldName};
 use super::move_object::MoveObject;
@@ -39,7 +39,8 @@ use super::{
 };
 use crate::context_data::db_data_provider::PgManager;
 use crate::context_data::package_cache::PackageCache;
-use crate::data::{self, Db, DbConnection, QueryExecutor};
+use crate::data::pg::coalesce;
+use crate::data::{self, Db, DbConnection, DieselBackend, QueryExecutor, RawSqlQuery};
 use crate::error::Error;
 use crate::types::base64::Base64;
 use sui_types::object::{
@@ -159,6 +160,22 @@ pub(crate) enum ObjectVersionKey {
     Latest,
     LatestAt(u64),   // checkpoint_sequence_number
     Historical(u64), // version
+}
+
+pub(crate) enum HistoricalObjectPaginationResult<I, T>
+where
+    I: Iterator<Item = T>,
+{
+    Error(HistoricalObjectPaginationError),
+    Success(bool, bool, I),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub(crate) enum HistoricalObjectPaginationError {
+    #[error(
+        "The requested checkpoint sequence number {0} is outside the available range: [{1}, {2}]"
+    )]
+    OutsideAvailableRange(u64, u64, u64),
 }
 
 pub(crate) type Cursor = cursor::BcsCursor<Vec<u8>>;
@@ -350,7 +367,7 @@ impl Object {
             return Ok(Connection::new(false, false));
         };
 
-        Object::paginate(ctx.data_unchecked(), page, filter)
+        Object::paginate_historical(ctx.data_unchecked(), page, None, None, filter)
             .await
             .extend()
     }
@@ -597,6 +614,141 @@ impl Object {
         Ok(conn)
     }
 
+    pub(crate) async fn paginate_historical(
+        db: &Db,
+        page: Page<Cursor>,
+        owner_type: Option<OwnerType>,
+        checkpoint_sequence_number: Option<u64>,
+        filter: ObjectFilter,
+    ) -> Result<Connection<String, Object>, Error> {
+        let pagination_results = db
+            .execute_repeatable(move |conn| {
+                use checkpoints::dsl as checkpoints;
+                use objects_snapshot::dsl as snapshot;
+
+                let mut rhs: i64 = conn.first(move || {
+                    checkpoints::checkpoints
+                        .select(checkpoints::sequence_number)
+                        .order(checkpoints::sequence_number.desc())
+                })?;
+
+                let mut lhs: i64 = conn
+                    .first(move || {
+                        snapshot::objects_snapshot
+                            .select(snapshot::checkpoint_sequence_number)
+                            .order(snapshot::checkpoint_sequence_number.desc())
+                    })
+                    .optional()?
+                    .unwrap_or_default();
+
+                if let Some(checkpoint_sequence_number) = checkpoint_sequence_number {
+                    if checkpoint_sequence_number > rhs as u64
+                        || checkpoint_sequence_number < lhs as u64
+                    {
+                        return Ok::<_, diesel::result::Error>(
+                            HistoricalObjectPaginationResult::Error(
+                                HistoricalObjectPaginationError::OutsideAvailableRange(
+                                    checkpoint_sequence_number,
+                                    lhs as u64,
+                                    rhs as u64,
+                                ),
+                            ),
+                        );
+                    }
+                    rhs = checkpoint_sequence_number as i64;
+                }
+
+                // TODO (wlmyng) for testing purposes, make sure to remove
+                if lhs == 0 {
+                    lhs = rhs - 1800;
+                }
+
+                let result =
+                    page.paginate_raw_query::<StoredHistoryObject, _>(conn, move || {
+                        let start_cp = lhs;
+                        let end_cp = rhs;
+
+                        let mut snapshot_query = RawSqlQuery {
+                            sql: "SELECT * FROM objects_snapshot".to_string(),
+                            alias: "objects_snapshot".to_string(),
+                            has_where_clause: false,
+                        };
+                        let mut history_query = RawSqlQuery {
+                            sql: "SELECT * FROM objects_history".to_string(),
+                            alias: "objects_history".to_string(),
+                            has_where_clause: false,
+                        };
+                        let checkpoint_bound = format!(
+                            "WHERE checkpoint_sequence_number BETWEEN {} AND {}",
+                            start_cp, end_cp
+                        );
+
+                        Object::raw_object_filter(&mut snapshot_query, owner_type, &filter);
+                        Object::raw_object_filter(&mut history_query, owner_type, &filter);
+
+                        // Join the two tables together, selecting objects that satisfy the filtering criteria
+                        let unioned = format!("{} UNION {}", snapshot_query.sql, history_query.sql);
+
+                        // Keep only the latest object_version for each object_id
+                        let candidates = format!(
+                            "SELECT DISTINCT ON (object_id) * \
+                    FROM ({unioned}) o \
+                    {checkpoint_bound} \
+                    ORDER BY object_id, object_version DESC"
+                        );
+
+                        let newer = format!(
+                            "SELECT object_id, object_version \
+                    FROM objects_history \
+                    WHERE checkpoint_sequence_number BETWEEN {} AND {}",
+                            start_cp, end_cp
+                        );
+
+                        // This left join checks whether every object that satisfies the filtering criteria
+                        // has an even newer version. If it does, drop it from the result set.
+                        let final_select = format!(
+                            "SELECT candidates.* FROM ({}) candidates \
+                    LEFT JOIN ({}) newer \
+                    ON ( \
+                        candidates.object_id = newer.object_id \
+                        AND \
+                        candidates.object_version < newer.object_version \
+                    ) \
+                    WHERE newer.object_version IS NULL",
+                            candidates, newer
+                        );
+
+                        RawSqlQuery {
+                            sql: final_select,
+                            alias: "candidates".to_string(),
+                            has_where_clause: true,
+                        }
+                    })?;
+
+                Ok(HistoricalObjectPaginationResult::Success(
+                    result.0, result.1, result.2,
+                ))
+            })
+            .await?;
+
+        let (prev, next, results) = match pagination_results {
+            HistoricalObjectPaginationResult::Error(e) => {
+                return Err(Error::Client(e.to_string()));
+            }
+            HistoricalObjectPaginationResult::Success(prev, next, results) => (prev, next, results),
+        };
+
+        let mut conn = Connection::new(prev, next);
+
+        for stored in results {
+            let cursor = stored.cursor().encode_cursor();
+            let object = Object::try_from(stored)?;
+            conn.edges.push(Edge::new(cursor, object));
+        }
+
+        Ok(conn)
+    }
+
     async fn query_live(db: &Db, address: SuiAddress) -> Result<Option<Self>, Error> {
         use objects::dsl as objects;
         let vec_address = address.into_vec();
@@ -612,6 +764,69 @@ impl Object {
             .map_err(|e| Error::Internal(format!("Failed to fetch object: {e}")))?;
 
         stored_obj.map(Self::try_from).transpose()
+    }
+
+    fn raw_object_filter(
+        query: &mut RawSqlQuery,
+        owner_type: Option<OwnerType>,
+        filter: &ObjectFilter,
+    ) {
+        let object_id_filter = filter
+            .object_ids
+            .as_ref()
+            .filter(|ids| !ids.is_empty())
+            .map(|object_ids| {
+                object_ids
+                    .iter()
+                    .map(|id| format!("'\\x{}'::bytea", hex::encode(id.into_vec())))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .map(|filter| format!("object_id IN ({})", filter));
+
+        let object_keys_filter = filter
+            .object_keys
+            .as_ref()
+            .filter(|keys| !keys.is_empty())
+            .map(|object_keys| {
+                object_keys
+                    .iter()
+                    .map(|ObjectKey { object_id, version }| {
+                        format!(
+                            "('\\x{}'::bytea AND object_version = {})",
+                            hex::encode(object_id.into_vec()),
+                            version
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            })
+            .map(|filter| format!("({})", filter));
+
+        match (object_id_filter, object_keys_filter) {
+            (Some(id_filter), Some(keys_filter)) => {
+                query.and_filter(format!("({}) OR {})", id_filter, keys_filter))
+            }
+            (Some(id_filter), None) => query.and_filter(format!("({})", id_filter)),
+            (None, Some(keys_filter)) => query.and_filter(format!("({})", keys_filter)),
+            (None, None) => {}
+        }
+
+        if let Some(owner_type) = &owner_type {
+            query.and_filter(format!("owner_type = {}", *owner_type as i16));
+        }
+
+        if let Some(type_) = &filter.type_ {
+            type_.apply_raw(query, "object_type");
+        }
+
+        if let Some(owner) = &filter.owner {
+            query.and_filter(format!(
+                "owner_id = '\\x{}'::bytea",
+                hex::encode(owner.into_vec())
+            ));
+            query.and_filter(format!("owner_type = {}", OwnerType::Address as i16));
+        }
     }
 
     async fn query_at_version(
@@ -877,9 +1092,43 @@ impl Target<Cursor> for StoredObject {
             query.order_by(dsl::object_id.desc())
         }
     }
+}
 
+impl CreateCursor<Cursor> for StoredObject {
     fn cursor(&self) -> Cursor {
         Cursor::new(self.object_id.clone())
+    }
+}
+
+impl CreateCursor<Cursor> for StoredHistoryObject {
+    fn cursor(&self) -> Cursor {
+        Cursor::new(self.object_id.clone())
+    }
+}
+
+impl RawTarget<Cursor> for StoredHistoryObject {
+    fn filter_ge(cursor: &Cursor, query: &mut RawSqlQuery) {
+        query.and_filter(format!(
+            "{}.object_id >= '\\x{}'::bytea",
+            query.alias,
+            hex::encode((**cursor).clone())
+        ))
+    }
+
+    fn filter_le(cursor: &Cursor, query: &mut RawSqlQuery) {
+        query.and_filter(format!(
+            "{}.object_id <= '\\x{}'::bytea",
+            query.alias,
+            hex::encode((**cursor).clone())
+        ))
+    }
+
+    fn order(asc: bool, query: &mut RawSqlQuery) {
+        query.update_sql(format!(
+            "ORDER BY {}.object_id {}",
+            query.alias,
+            if asc { "ASC" } else { "DESC" }
+        ));
     }
 }
 

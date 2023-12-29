@@ -5,7 +5,7 @@ use crate::data::{Db, QueryExecutor};
 use crate::error::Error;
 
 use super::big_int::BigInt;
-use super::cursor::{Page, Target};
+use super::cursor::{CreateCursor, Page};
 use super::move_object::MoveObject;
 use super::object::{self, Object};
 use super::sui_address::SuiAddress;

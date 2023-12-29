@@ -34,7 +34,7 @@ use crate::{
 use super::{
     address::Address,
     base64::Base64,
-    cursor::{self, Page, Target},
+    cursor::{self, CreateCursor, Page, Target},
     digest::Digest,
     epoch::Epoch,
     gas::GasInput,
@@ -416,7 +416,9 @@ impl Target<Cursor> for StoredTransaction {
             query.order_by(dsl::tx_sequence_number.desc())
         }
     }
+}
 
+impl CreateCursor<Cursor> for StoredTransaction {
     fn cursor(&self) -> Cursor {
         Cursor::new(self.tx_sequence_number as u64)
     }

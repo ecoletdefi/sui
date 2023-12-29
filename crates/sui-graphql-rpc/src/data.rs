@@ -5,8 +5,10 @@ pub(crate) mod pg;
 
 use async_trait::async_trait;
 use diesel::{
+    deserialize::FromSqlRow,
     query_builder::{BoxedSelectStatement, FromClause, QueryFragment, QueryId},
     query_dsl::{methods::LimitDsl, LoadQuery},
+    sql_types::Untyped,
     QueryResult,
 };
 
@@ -29,6 +31,16 @@ pub(crate) type DieselBackend = <Db as QueryExecutor>::Backend;
 /// These type parameters should usually be inferred by context.
 pub(crate) type Query<ST, QS, GB> =
     BoxedSelectStatement<'static, ST, FromClause<QS>, DieselBackend, GB>;
+
+// With the below, we approach BoxedSqlQuery ... could potentially leverage that?
+// although we still need the alias .. hmm....
+#[derive(Clone)]
+pub(crate) struct RawSqlQuery {
+    pub sql: String,
+    // typically more complex queries, alias to help
+    pub alias: String,
+    pub has_where_clause: bool,
+}
 
 /// Interface for accessing relational data written by the Indexer, agnostic of the database
 /// back-end being used.
@@ -83,6 +95,10 @@ pub(crate) trait DbConnection {
         Q: LoadQuery<'static, Self::Connection, U>,
         Q: QueryId + QueryFragment<Self::Backend>;
 
+    fn raw_results<U>(&mut self, query: String) -> QueryResult<Vec<U>>
+    where
+        U: FromSqlRow<Untyped, Self::Backend> + 'static;
+
     /// Helper to limit a query that fetches multiple values to return only its first value. `query`
     /// is a thunk that returns a query when called.
     fn first<Q: LimitDsl, U>(&mut self, query: impl Fn() -> Q) -> QueryResult<U>
@@ -92,5 +108,33 @@ pub(crate) trait DbConnection {
         <Q as LimitDsl>::Output: QueryId + QueryFragment<Self::Backend>,
     {
         self.result(move || query().limit(1i64))
+    }
+}
+
+impl RawSqlQuery {
+    pub(crate) fn update_sql(&mut self, sql: String) {
+        self.sql = format!("{} {}", self.sql, sql);
+    }
+
+    pub(crate) fn and_filter(&mut self, sql: String) {
+        if self.has_where_clause {
+            self.sql = format!("{} AND ({})", self.sql, sql);
+        } else {
+            self.sql = format!("{} WHERE ({})", self.sql, sql);
+            self.has_where_clause = true;
+        }
+    }
+
+    pub(crate) fn limit(&mut self, limit: i64) {
+        self.sql = format!("{} LIMIT {};", self.sql, limit);
+    }
+
+    pub(crate) fn or_filter(&mut self, sql: String) {
+        if self.has_where_clause {
+            self.sql = format!("{} OR ({})", self.sql, sql);
+        } else {
+            self.sql = format!("{} WHERE ({})", self.sql, sql);
+            self.has_where_clause = true;
+        }
     }
 }
