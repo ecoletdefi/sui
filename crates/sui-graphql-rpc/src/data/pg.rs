@@ -5,8 +5,7 @@ use super::QueryExecutor;
 use crate::{config::Limits, error::Error};
 use async_trait::async_trait;
 use diesel::deserialize::FromSqlRow;
-use diesel::sql_function;
-use diesel::sql_types::{Int8, Nullable, Untyped};
+use diesel::sql_types::Untyped;
 use diesel::{
     pg::Pg,
     query_builder::{Query, QueryFragment, QueryId},
@@ -166,8 +165,6 @@ mod query_cost {
         parsed.get(0)?.get("Plan")?.get("Total Cost")?.as_f64()
     }
 }
-
-sql_function! { fn coalesce(x: Nullable<Int8>, y: Int8) -> Int8; }
 
 #[cfg(all(test, feature = "pg_integration"))]
 mod tests {

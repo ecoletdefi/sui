@@ -39,7 +39,6 @@ use super::{
 };
 use crate::context_data::db_data_provider::PgManager;
 use crate::context_data::package_cache::PackageCache;
-use crate::data::pg::coalesce;
 use crate::data::{self, Db, DbConnection, DieselBackend, QueryExecutor, RawSqlQuery};
 use crate::error::Error;
 use crate::types::base64::Base64;
