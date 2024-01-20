@@ -128,13 +128,4 @@ impl RawSqlQuery {
     pub(crate) fn limit(&mut self, limit: i64) {
         self.sql = format!("{} LIMIT {};", self.sql, limit);
     }
-
-    pub(crate) fn or_filter(&mut self, sql: String) {
-        if self.has_where_clause {
-            self.sql = format!("{} OR ({})", self.sql, sql);
-        } else {
-            self.sql = format!("{} WHERE ({})", self.sql, sql);
-            self.has_where_clause = true;
-        }
-    }
 }

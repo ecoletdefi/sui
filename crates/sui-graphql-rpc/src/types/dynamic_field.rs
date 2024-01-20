@@ -11,7 +11,7 @@ use sui_indexer::types_v2::OwnerType;
 use sui_package_resolver::Resolver;
 use sui_types::dynamic_field::{derive_dynamic_field_id, DynamicFieldInfo, DynamicFieldType};
 
-use super::cursor::{CreateCursor, Page, Target};
+use super::cursor::{CreateCursor, Page};
 use super::object::{self, deserialize_move_struct, ObjectVersionKey};
 use super::type_filter::ExactTypeFilter;
 use super::{

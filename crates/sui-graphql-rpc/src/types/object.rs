@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
+use std::ops::Deref;
 
 use crate::types::intersect;
 use async_graphql::connection::{CursorType, Edge};
@@ -39,7 +40,7 @@ use super::{
 };
 use crate::context_data::db_data_provider::PgManager;
 use crate::context_data::package_cache::PackageCache;
-use crate::data::{self, Db, DbConnection, DieselBackend, QueryExecutor, RawSqlQuery};
+use crate::data::{self, Db, DbConnection, QueryExecutor, RawSqlQuery};
 use crate::error::Error;
 use crate::types::base64::Base64;
 use sui_types::object::{
@@ -54,7 +55,9 @@ pub(crate) struct Object {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ObjectKind {
-    /// An object loaded from serialized data, such as the contents of a transaction.
+    /// An object loaded from serialized data, such as the contents of a transaction. This is used
+    /// to represent system packages that are written before the new epoch starts, or from the
+    /// genesis transaction.
     NotIndexed(NativeObject),
     /// An object fetched from the live objects table.
     Live(NativeObject, StoredObject),
@@ -175,9 +178,11 @@ pub(crate) enum HistoricalObjectPaginationError {
         "The requested checkpoint sequence number {0} is outside the available range: [{1}, {2}]"
     )]
     OutsideAvailableRange(u64, u64, u64),
+    #[error("Inconsistent cursor")]
+    InconsistentCursor,
 }
 
-pub(crate) type Cursor = cursor::BcsCursor<Vec<u8>>;
+pub(crate) type Cursor = cursor::BcsCursor<(Vec<u8>, u64)>;
 type Query<ST, GB> = data::Query<ST, objects::table, GB>;
 
 /// An object in Sui is a package (set of Move bytecode modules) or object (typed data structure
@@ -366,9 +371,15 @@ impl Object {
             return Ok(Connection::new(false, false));
         };
 
-        Object::paginate_historical(ctx.data_unchecked(), page, None, None, filter)
-            .await
-            .extend()
+        Object::paginate_historical(
+            ctx.data_unchecked(),
+            page,
+            Some(OwnerType::Address),
+            self.at_checkpoint_impl(),
+            filter,
+        )
+        .await
+        .extend()
     }
 
     /// The balance of coin objects of a particular coin type owned by the object.
@@ -544,6 +555,17 @@ impl Object {
         }
     }
 
+    pub(crate) fn at_checkpoint_impl(&self) -> Option<u64> {
+        use ObjectKind as K;
+
+        match &self.kind {
+            K::Live(_, stored) => Some(stored.checkpoint_sequence_number as u64),
+            K::Historical(_, stored) => Some(stored.checkpoint_sequence_number as u64),
+            K::NotIndexed(_) => None,
+            K::WrappedOrDeleted(stored) => Some(stored.checkpoint_sequence_number as u64),
+        }
+    }
+
     /// Query the database for a `page` of objects, optionally `filter`-ed.
     pub(crate) async fn paginate(
         db: &Db,
@@ -620,11 +642,36 @@ impl Object {
         checkpoint_sequence_number: Option<u64>,
         filter: ObjectFilter,
     ) -> Result<Connection<String, Object>, Error> {
+        // Regardless of whether the cursor is the upper or lower bound, the cursor's
+        // checkpoint_sequence_number identifies the consistent upper bound when it was calculated
+
+        let options = [
+            page.after().map(|after| after.deref().1),
+            page.before().map(|before| before.deref().1),
+            checkpoint_sequence_number,
+        ];
+
+        let mut values = options.iter().flatten();
+
+        let checkpoint_sequence_number = if let Some(first_val) = values.next() {
+            if values.all(|val| val == first_val) {
+                Ok(Some(first_val.clone()))
+            } else {
+                Err(Error::Client(
+                    HistoricalObjectPaginationError::InconsistentCursor.to_string(),
+                ))
+            }
+        } else {
+            Ok(None)
+        }?;
+
         let pagination_results = db
             .execute_repeatable(move |conn| {
                 use checkpoints::dsl as checkpoints;
                 use objects_snapshot::dsl as snapshot;
 
+                // If the checkpoint_sequence_number among cursor(s) and input is consistent, it
+                // still needs to be within the graphql's availableRange
                 let mut rhs: i64 = conn.first(move || {
                     checkpoints::checkpoints
                         .select(checkpoints::sequence_number)
@@ -1076,11 +1123,11 @@ impl Target<Cursor> for StoredObject {
     type Source = objects::table;
 
     fn filter_ge<ST, GB>(cursor: &Cursor, query: Query<ST, GB>) -> Query<ST, GB> {
-        query.filter(objects::dsl::object_id.ge((**cursor).clone()))
+        query.filter(objects::dsl::object_id.ge((**cursor).0.clone()))
     }
 
     fn filter_le<ST, GB>(cursor: &Cursor, query: Query<ST, GB>) -> Query<ST, GB> {
-        query.filter(objects::dsl::object_id.le((**cursor).clone()))
+        query.filter(objects::dsl::object_id.le((**cursor).0.clone()))
     }
 
     fn order<ST, GB>(asc: bool, query: Query<ST, GB>) -> Query<ST, GB> {
@@ -1095,13 +1142,19 @@ impl Target<Cursor> for StoredObject {
 
 impl CreateCursor<Cursor> for StoredObject {
     fn cursor(&self) -> Cursor {
-        Cursor::new(self.object_id.clone())
+        Cursor::new((
+            self.object_id.clone(),
+            self.checkpoint_sequence_number as u64,
+        ))
     }
 }
 
 impl CreateCursor<Cursor> for StoredHistoryObject {
     fn cursor(&self) -> Cursor {
-        Cursor::new(self.object_id.clone())
+        Cursor::new((
+            self.object_id.clone(),
+            self.checkpoint_sequence_number as u64,
+        ))
     }
 }
 
@@ -1110,7 +1163,7 @@ impl RawTarget<Cursor> for StoredHistoryObject {
         query.and_filter(format!(
             "{}.object_id >= '\\x{}'::bytea",
             query.alias,
-            hex::encode((**cursor).clone())
+            hex::encode((**cursor).0.clone())
         ))
     }
 
@@ -1118,7 +1171,7 @@ impl RawTarget<Cursor> for StoredHistoryObject {
         query.and_filter(format!(
             "{}.object_id <= '\\x{}'::bytea",
             query.alias,
-            hex::encode((**cursor).clone())
+            hex::encode((**cursor).0.clone())
         ))
     }
 
