@@ -704,11 +704,6 @@ impl Object {
                     rhs = checkpoint_sequence_number as i64;
                 }
 
-                // TODO (wlmyng) for testing purposes, make sure to remove
-                if lhs == 0 {
-                    lhs = rhs - 1800;
-                }
-
                 let result =
                     page.paginate_raw_query::<StoredHistoryObject, _>(conn, move || {
                         let start_cp = lhs;

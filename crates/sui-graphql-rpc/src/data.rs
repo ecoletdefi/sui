@@ -32,8 +32,6 @@ pub(crate) type DieselBackend = <Db as QueryExecutor>::Backend;
 pub(crate) type Query<ST, QS, GB> =
     BoxedSelectStatement<'static, ST, FromClause<QS>, DieselBackend, GB>;
 
-// With the below, we approach BoxedSqlQuery ... could potentially leverage that?
-// although we still need the alias .. hmm....
 #[derive(Clone)]
 pub(crate) struct RawSqlQuery {
     pub sql: String,
